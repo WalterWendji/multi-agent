@@ -1,8 +1,10 @@
 import os
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
+from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain.agents import create_agent
+from langchain.tools import tool, ToolRuntime
 
 
 load_dotenv()
@@ -15,7 +17,7 @@ if not os.environ.get("GOOGLE_API_KEY"):
 
 #model = init_chat_model(model="gpt-5-nano", temperature=0)
 #model = init_chat_model("google_genai:gemini-2.5-flash")
-model = init_chat_model("openai:gpt-5-nano")
+model = ChatOpenAI(model="gpt-5-nano", temperature=0)
 
 @tool
 def create_calendar_event(
@@ -101,17 +103,23 @@ for step in email_agent.stream(
              """
 
 @tool
-def schedule_event(request: str) -> str:
-    """Schedule calendar events using natural language.
-
-    Use this when the user wants to create, modify, or check calendar appointments.
-    Handles date/time parsing, availability checking, and event creation.
-
-    Input: Natural language scheduling request (e.g., 'meeting with design team
-    next Tuesday at 2pm')
-    """
+def schedule_event(
+    request: str,
+    runtime: ToolRuntime
+) -> str:
+    """Schedule calendar events using natural language."""
+    
+    original_user_message = next(
+        message for message in runtime.state["messages"]
+        if message.type == "human"
+    )
+    prompt = ("You are assisting with the following user inquirey:\n\n"
+    f"{original_user_message.text}\n\n"
+    "You are tasked with the following sub-request:\n\n"
+    f"{request}"
+    )
     result = calendar_agent.invoke({
-        "messages": [{"role": "user", "content": request}]
+        "messages": [{"role": "user", "content": prompt}]
     })
     return result["messages"][-1].text
 
@@ -145,7 +153,7 @@ supervisor_agent = create_agent(
     system_prompt=SUPERVISOR_PROMPT,
 )
 
-query = ("Schedule a meeting with the design team next Tuesday at 2pm for 1 hour, "
+""" query = ("Schedule a meeting with the design team next Tuesday at 2pm for 1 hour, "
         "and send them an email reminder about reviewing the new mockups."
 )
     
@@ -155,3 +163,24 @@ for step in supervisor_agent.stream(
     for update in step.values():
         for message in update.get("messages", []):
             message.pretty_print()
+             """
+
+def run_multi_agent():
+    # Example: User request requiring both calendar and email coordination
+    user_request = (
+        "Schedule a meeting with the design team next Tuesday at 2pm for 1 hour, "
+        "and send them an email reminder about reviewing the new mockups."
+    )
+
+    print("User Request:", user_request)
+    print("\n" + "="*80 + "\n")
+
+    for step in supervisor_agent.stream(
+        {"messages": [{"role": "user", "content": user_request}]}
+    ):
+        for update in step.values():
+            for message in update.get("messages", []):
+                message.pretty_print()
+
+if __name__ == "__main__":
+    run_multi_agent()

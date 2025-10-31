@@ -1,5 +1,7 @@
+from multi_agent import run_multi_agent
+
 def main():
-    print("Hello from ai-agent!")
+    run_multi_agent()
 
 
 if __name__ == "__main__":
