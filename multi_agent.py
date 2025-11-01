@@ -2,10 +2,18 @@ import os
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool
+from langchain_ollama import ChatOllama #For local model
 from langchain.agents import create_agent
 from langchain.tools import tool, ToolRuntime
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, Annotated, Sequence
+from langchain_core.messages import BaseMessage, ToolMessage, HumanMessage
+import operator
 
+
+#The AgentState is the graph's state.
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], operator.add]
 
 load_dotenv()
 if not os.environ.get("OPENAI_API_KEY"):
@@ -18,6 +26,32 @@ if not os.environ.get("GOOGLE_API_KEY"):
 #model = init_chat_model(model="gpt-5-nano", temperature=0)
 #model = init_chat_model("google_genai:gemini-2.5-flash")
 model = ChatOpenAI(model="gpt-5-nano", temperature=0)
+#model = ChatOllama(model="qwen3:8b", temperature=0)
+
+
+#Helper function to create an agent node
+def create_agent_node(agent, agent_name):
+    def agent_node(state):
+        result = agent.invoke(state)
+        # We convert the agent's response to a ToolMessage
+        return {"messages": [ToolMessage(content=result["messages"][-1].text, tool_call_id=agent_name)]}
+    return agent_node
+
+def router(state):
+    last_message = state["messages"][-1]
+    # If the last message is a ToolMessage, it means an agent has just run.
+    if isinstance(last_message, ToolMessage):
+        return "END"
+    if "schedule" in last_message.content.lower() or "meeting" in last_message.content.lower():
+        return "calendar"
+    if "email" in last_message.content.lower() or "send" in last_message.content.lower():
+        return "email"
+    else:
+        # If no specific agent is needed, we can end.
+        return "END"
+ 
+
+workflow = StateGraph(AgentState)
 
 @tool
 def create_calendar_event(
@@ -38,7 +72,7 @@ def send_email(
     body: str,
     cc: list[str] = []
 ) -> str:
-    """Send an email via email API. Requires properly formatted email addressess."""
+    """Send an email via email API. Requires properly formatted email addresses."""
     # Stub: In practice, this would call SendGrid, Gmail API, etc.
     return f"Email sent to to {',' .join(to)} - Subject: {subject}"
 
@@ -113,7 +147,7 @@ def schedule_event(
         message for message in runtime.state["messages"]
         if message.type == "human"
     )
-    prompt = ("You are assisting with the following user inquirey:\n\n"
+    prompt = ("You are assisting with the following user inquiry:\n\n"
     f"{original_user_message.text}\n\n"
     "You are tasked with the following sub-request:\n\n"
     f"{request}"
@@ -165,6 +199,32 @@ for step in supervisor_agent.stream(
             message.pretty_print()
              """
 
+calendar_node = create_agent_node(calendar_agent, "calendar") 
+email_node = create_agent_node(email_agent, "email")
+
+workflow.add_node("calendar", calendar_node)
+workflow.add_node("email", email_node)
+supervisor_node = create_agent_node(supervisor_agent, "supervisor")
+workflow.add_node("supervisor", supervisor_node)
+
+
+workflow.set_entry_point("supervisor")
+workflow.add_conditional_edges(
+    "supervisor",
+    router,
+    {
+        "calendar": "calendar",
+        "email": "email",
+        "END": END,
+    }
+)
+
+workflow.add_edge('calendar', END)
+workflow.add_edge('email', END)
+
+app = workflow.compile()
+
+
 def run_multi_agent():
     # Example: User request requiring both calendar and email coordination
     user_request = (
@@ -175,12 +235,21 @@ def run_multi_agent():
     print("User Request:", user_request)
     print("\n" + "="*80 + "\n")
 
-    for step in supervisor_agent.stream(
+    """ for step in supervisor_agent.stream(
         {"messages": [{"role": "user", "content": user_request}]}
     ):
         for update in step.values():
             for message in update.get("messages", []):
-                message.pretty_print()
+                message.pretty_print() """
 
+    for event in app.stream({"messages": [HumanMessage(content=user_request)]}):
+        for value in event.values():
+            print("---")
+            if "messages" in value:
+                for msg in value["messages"]:
+                    if hasattr(msg, 'pretty_print'):
+                        msg.pretty_print()
+                    else:
+                        print(msg)
 if __name__ == "__main__":
     run_multi_agent()
