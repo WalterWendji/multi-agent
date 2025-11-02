@@ -1,4 +1,7 @@
 import os
+import operator
+import asyncio
+
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama #For local model
@@ -8,8 +11,21 @@ from langchain.tools import tool, ToolRuntime
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Annotated, Sequence
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
-import operator
+from langchain_mcp_adapters.tools import load_mcp_tools
+from langgraph.prebuilt import tools_condition
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
+
+#Configuration for remote MCP servers
+CALENDAR_MCP_URL = "https://"
+GMAIL_MCP_URL = "https://"
+
+_mcp_session = None
+
+#Store MCP sessions
+calendar_mcp_tools = None
+gmail_mcp_tools = None
 
 #The AgentState is the graph's state.
 class AgentState(TypedDict):
@@ -24,8 +40,8 @@ if not os.environ.get("GOOGLE_API_KEY"):
     raise ValueError("GOOGLE_API_KEY environment variable not set") from None
 
 
-model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-#model = ChatOpenAI(model="gpt-5-nano", temperature=0)
+#model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+model = ChatOpenAI(model="gpt-5-nano", temperature=0)
 #model = ChatOllama(model="qwen3:8b", temperature=0)
 
 
@@ -140,38 +156,107 @@ def router(state):
 
 workflow = StateGraph(AgentState)
 
-@tool
-def create_calendar_event(
-    title: str,
-    start_time: str,
-    end_time: str,
-    attendees: list[str],
-    location: str =""
-) -> str:
-    """Create a calendar event. Requires exact ISO datetime format."""
-    #Stub: In practice, this would call Google Calendar API, Outlook API, etc:
-    return f"Event created: {title} from {start_time} to {end_time} with {len(attendees)} attendees"
+async def setup_workspace_mcp_tools():
+    """Connect to local Google Workspace MCP server and get all tools."""
+    
+    
+    
+    server_params = StdioServerParameters(
+        command="uv",
+        args=["run", "--directory", "../google_workspace_mcp", "main.py", "--single-user"]
+    )
+    
+    
+    
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            
+            # Get all tools from the server
+            tools = await load_mcp_tools(session)
+    
+            
+            return tools, session
+        
+        
 
-@tool
-def send_email(
-    to: list[str],
-    subject: str,
-    body: str,
-    cc: list[str] = []
-) -> str:
-    """Send an email via email API. Requires properly formatted email addresses."""
-    # Stub: In practice, this would call SendGrid, Gmail API, etc.
-    return f"Email sent to to {',' .join(to)} - Subject: {subject}"
+async def setup_calendar_mcp_tools():
+    """Set up calendar MCP tools from remote server."""
+    
+    #For stdio-based MCP servers
+    server_params = StdioServerParameters(
+        command="npx",
+        args=["-y", "mcp-remote", CALENDAR_MCP_URL]
+    )
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            
+            #Convert MCP tools to Langchain tools
+            adapter = load_mcp_tools(session)
+            langchain_tools = adapter.to_langchain_tools()
+            
+            return langchain_tools
+            
+            
+async def setup_gmail_mcp_tools():
+    """Set up Gmail MCP tools from remote server."""
+    server_params = StdioServerParameters(
+        command="npx",
+        args=["-y", "mcp-remote", GMAIL_MCP_URL]
+    ) 
+    
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            
+            tools = await load_mcp_tools(session)
+            langchain_tools = tools.to_langchain_tools()
+            
+            return tools
+    
 
-@tool
-def get_available_time_slots(
-    attendees: list[str],
-    date: str,
-    duration_minutes: int
-) -> list[str]:
-    """Check calendar availability for given attendees on a specific date."""
-    #Stub: In practice, this would query calendar APIs
-    return ["09:00", "14:00", "16:00"]
+async def initialize_mcp_tools():
+    """Initialize MCP tools from remote servers."""
+    global calendar_mcp_tools, gmail_mcp_tools
+    
+    #Run async functions in sync context
+    # Connect to the workspace MCP server
+    all_tools, session = await setup_workspace_mcp_tools()
+    
+    calendar_tool_names = [
+        "create_event", "modify_event","list_calendars", 
+        "get_event"
+    ]
+    
+    calendar_mcp_tools = [
+        tool for tool in all_tools 
+        if any(name in tool.name.lower() for name in calendar_tool_names)
+    ]
+    
+    # Filter tools for gmail (based on tool names - adjust as needed)
+    gmail_tool_names = [
+        "send_gmail_message","draft_gmail_message"
+    ]
+    gmail_mcp_tools = [
+        tool for tool in all_tools 
+        if any(name in tool.name.lower() for name in gmail_tool_names)
+    ]
+    
+    print(f"Loaded {len(calendar_mcp_tools)} calendar tools")
+    print(f"Loaded {len(gmail_mcp_tools)} gmail tools")
+    
+
+
+def initialize_mcp_tools_sync():
+    """Wrapper to run async initialization synchronously."""
+    asyncio.run(initialize_mcp_tools())
+
+# Initialize at module level (or move to a function called before creating agents)
+initialize_mcp_tools_sync()
+
+
 
 
 CALENDAR_AGENT_PROMPT = (
@@ -185,7 +270,7 @@ CALENDAR_AGENT_PROMPT = (
 
 calendar_agent = create_agent(
     model,
-    tools=[create_calendar_event, get_available_time_slots],
+    tools=calendar_mcp_tools,
     system_prompt=CALENDAR_AGENT_PROMPT,
 )
 
@@ -201,7 +286,7 @@ EMAIL_AGENT_PROMPT = (
 
 email_agent = create_agent(
     model,
-    tools=[send_email],
+    tools=gmail_mcp_tools,
     system_prompt=EMAIL_AGENT_PROMPT,
 )
 
