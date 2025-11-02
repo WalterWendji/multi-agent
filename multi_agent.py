@@ -1,19 +1,20 @@
 import os
 from dotenv import load_dotenv
-from langchain.chat_models import init_chat_model
 from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama #For local model
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import create_agent
 from langchain.tools import tool, ToolRuntime
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Annotated, Sequence
-from langchain_core.messages import BaseMessage, ToolMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 import operator
 
 
 #The AgentState is the graph's state.
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
+    completed_actions: set[str]  # Track completed agent actions
 
 load_dotenv()
 if not os.environ.get("OPENAI_API_KEY"):
@@ -23,9 +24,8 @@ if not os.environ.get("GOOGLE_API_KEY"):
     raise ValueError("GOOGLE_API_KEY environment variable not set") from None
 
 
-#model = init_chat_model(model="gpt-5-nano", temperature=0)
-#model = init_chat_model("google_genai:gemini-2.5-flash")
-model = ChatOpenAI(model="gpt-5-nano", temperature=0)
+model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+#model = ChatOpenAI(model="gpt-5-nano", temperature=0)
 #model = ChatOllama(model="qwen3:8b", temperature=0)
 
 
@@ -33,22 +33,109 @@ model = ChatOpenAI(model="gpt-5-nano", temperature=0)
 def create_agent_node(agent, agent_name):
     def agent_node(state):
         result = agent.invoke(state)
-        # We convert the agent's response to a ToolMessage
-        return {"messages": [ToolMessage(content=result["messages"][-1].text, tool_call_id=agent_name)]}
+        # Get messages from agent result
+        messages = result["messages"]
+        # Get current completed actions from state, or initialize empty set
+        completed_actions = state.get("completed_actions", set()).copy()
+        # Mark this agent as completed (only for calendar and email agents)
+        if agent_name in ['calendar', 'email']:
+            completed_actions.add(agent_name)
+        return {"messages": messages, "completed_actions": completed_actions}
     return agent_node
 
 def router(state):
-    last_message = state["messages"][-1]
-    # If the last message is a ToolMessage, it means an agent has just run.
-    if isinstance(last_message, ToolMessage):
+    """
+    Routes based on the supervisor agent's response or completion status.
+    Checks for tool calls first, then falls back to content analysis.
+    Handles multi-action requests by tracking completed actions.
+    """
+    messages = state["messages"]
+    
+    # Get completed actions from state
+    completed_actions = state.get("completed_actions", set())
+    
+    # Get the original user request
+    original_request = None
+    for m in messages:
+        if isinstance(m, HumanMessage):
+            original_request = m.content.lower()
+            break
+    
+    # Check if we just completed an action and need to route to the next one
+    # Look at the last few messages to see if a calendar/email agent just ran
+    if completed_actions:
+        # Check if there are more actions pending based on original request
+        if original_request:
+            has_calendar = any(kw in original_request for kw in ["schedule", "meeting", "calendar", "appointment"])
+            has_email = any(kw in original_request for kw in ["email", "send", "message", "notify", "reminder"])
+            
+            # If we just completed calendar and email is still pending, route to email
+            if 'calendar' in completed_actions and has_email and 'email' not in completed_actions:
+                return "email"
+            # If we just completed email and calendar is still pending, route to calendar
+            elif 'email' in completed_actions and has_calendar and 'calendar' not in completed_actions:
+                return "calendar"
+            # If both are completed, end
+            elif ('calendar' in completed_actions and has_calendar) and ('email' in completed_actions and has_email):
+                return "END"
+    
+    # Look for the most recent AI message from supervisor
+    last_ai_message = None
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            last_ai_message = msg
+            break
+    
+    # If no AI message found, analyze the last message's content
+    if last_ai_message is None:
+        last_message = messages[-1] if messages else None
+        if last_message:
+            content = getattr(last_message, 'content', str(last_message)).lower()
+            if any(keyword in content for keyword in ["schedule", "meeting", "calendar", "appointment"]):
+                return "calendar"
+            elif any(keyword in content for keyword in ["email", "send", "message", "notify"]):
+                return "email"
         return "END"
-    if "schedule" in last_message.content.lower() or "meeting" in last_message.content.lower():
+    
+    # Check for tool calls in the AI message
+    if hasattr(last_ai_message, 'tool_calls') and last_ai_message.tool_calls:
+        tool_calls = last_ai_message.tool_calls
+        for tool_call in tool_calls:
+            tool_name = tool_call.get('name', '') if isinstance(tool_call, dict) else getattr(tool_call, 'name', '')
+            if tool_name == 'schedule_event':
+                return "calendar"
+            elif tool_name == 'manage_email':
+                return "email"
+    
+    # Fall back to content analysis of supervisor's response
+    content = (last_ai_message.content or "").lower()
+    
+    # Check for calendar-related keywords
+    calendar_keywords = ["schedule", "meeting", "calendar", "appointment", "book", "reserve"]
+    has_calendar = any(keyword in content for keyword in calendar_keywords)
+    
+    # Check for email-related keywords
+    email_keywords = ["email", "send", "message", "notify", "reminder", "mail"]
+    has_email = any(keyword in content for keyword in email_keywords)
+    
+    # Prioritize calendar if both are present and not completed
+    if has_calendar and 'calendar' not in completed_actions:
         return "calendar"
-    if "email" in last_message.content.lower() or "send" in last_message.content.lower():
+    elif has_email and 'email' not in completed_actions:
         return "email"
-    else:
-        # If no specific agent is needed, we can end.
-        return "END"
+    
+    # If no clear routing signal from supervisor, check original request as fallback
+    if original_request:
+        has_calendar = any(kw in original_request for kw in ["schedule", "meeting", "calendar", "appointment"])
+        has_email = any(kw in original_request for kw in ["email", "send", "message", "notify", "reminder"])
+        
+        if has_calendar and 'calendar' not in completed_actions:
+            return "calendar"
+        if has_email and 'email' not in completed_actions:
+            return "email"
+    
+    # If no clear routing signal, end the workflow
+    return "END"
  
 
 workflow = StateGraph(AgentState)
@@ -102,14 +189,6 @@ calendar_agent = create_agent(
     system_prompt=CALENDAR_AGENT_PROMPT,
 )
 
-""" query= "Schedule a team meeting next Tuesday at 2pm for 1 hour"
-
-for step in calendar_agent.stream(
-    {"messages": [{"role": "user", "content":query}]}
-):
-    for update in step.values():
-        for message in update.get("messages", []):
-            message.pretty_print() """
             
 
 EMAIL_AGENT_PROMPT = (
@@ -126,15 +205,6 @@ email_agent = create_agent(
     system_prompt=EMAIL_AGENT_PROMPT,
 )
 
-""" query = "Send the design team a reminder about reviewing the new mockups"
-
-for step in email_agent.stream(
-    {"messages": [{"role": "user", "content":query}]}
-):
-    for update in step.values():
-        for message in update.get("messages", []):
-            message.pretty_print()
-             """
 
 @tool
 def schedule_event(
@@ -175,29 +245,21 @@ def manage_email(request: str) -> str:
     return result["messages"][-1].text
 
 SUPERVISOR_PROMPT  = (
-    "You are a helpful personal assistant. "
-    "You can schedule calendar events and send emails. "
-    "Break down user requests into appropriate tool calls and coordinate the results. "
-    "When a request involves multiple actions, use multiple tools in sequence."
+    "You are a helpful personal assistant coordinator. "
+    "Analyze user requests and determine which specialized agent should handle them. "
+    "Respond with clear routing hints: "
+    "- If the request involves scheduling, meetings, or calendar events, mention 'calendar' or 'schedule'"
+    "- If the request involves sending emails, messages, or notifications, mention 'email' or 'send'"
+    "For requests involving multiple actions, prioritize the first action or the most important one. "
+    "Keep your response concise and focused on routing."
 )
 
 supervisor_agent = create_agent(
     model,
-    tools=[schedule_event, manage_email],
+    tools=[],  # Supervisor doesn't call tools, it routes to specialized agents
     system_prompt=SUPERVISOR_PROMPT,
 )
 
-""" query = ("Schedule a meeting with the design team next Tuesday at 2pm for 1 hour, "
-        "and send them an email reminder about reviewing the new mockups."
-)
-    
-for step in supervisor_agent.stream(
-    {"messages": [{"role":"user", "content":query}]}
-):
-    for update in step.values():
-        for message in update.get("messages", []):
-            message.pretty_print()
-             """
 
 calendar_node = create_agent_node(calendar_agent, "calendar") 
 email_node = create_agent_node(email_agent, "email")
@@ -219,8 +281,25 @@ workflow.add_conditional_edges(
     }
 )
 
-workflow.add_edge('calendar', END)
-workflow.add_edge('email', END)
+# Route calendar and email nodes back to supervisor to check for additional actions
+workflow.add_conditional_edges(
+    'calendar',
+    router,
+    {
+        "calendar": "calendar",
+        "email": "email",
+        "END": END,
+    }
+)
+workflow.add_conditional_edges(
+    'email',
+    router,
+    {
+        "calendar": "calendar",
+        "email": "email",
+        "END": END,
+    }
+)
 
 app = workflow.compile()
 
@@ -235,14 +314,7 @@ def run_multi_agent():
     print("User Request:", user_request)
     print("\n" + "="*80 + "\n")
 
-    """ for step in supervisor_agent.stream(
-        {"messages": [{"role": "user", "content": user_request}]}
-    ):
-        for update in step.values():
-            for message in update.get("messages", []):
-                message.pretty_print() """
-
-    for event in app.stream({"messages": [HumanMessage(content=user_request)]}):
+    for event in app.stream({"messages": [HumanMessage(content=user_request)], "completed_actions": set()}):
         for value in event.values():
             print("---")
             if "messages" in value:
