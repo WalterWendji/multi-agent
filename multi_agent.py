@@ -10,27 +10,28 @@ from langchain.agents import create_agent
 from langchain.tools import tool, ToolRuntime
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Annotated, Sequence
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.prebuilt import tools_condition
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from langgraph.checkpoint.memory import MemorySaver
 
-
-#Configuration for remote MCP servers
-CALENDAR_MCP_URL = "https://"
-GMAIL_MCP_URL = "https://"
-
-_mcp_session = None
 
 #Store MCP sessions
 calendar_mcp_tools = None
 gmail_mcp_tools = None
 
+
+
+
 #The AgentState is the graph's state.
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     completed_actions: set[str]  # Track completed agent actions
+
+
+
 
 load_dotenv()
 if not os.environ.get("OPENAI_API_KEY"):
@@ -74,8 +75,18 @@ def router(state):
     original_request = None
     for m in messages:
         if isinstance(m, HumanMessage):
-            original_request = m.content.lower()
+            original_request = m.content if m.content else ""
             break
+            
+    # SHORT-CIRCUIT: If no actionable keywords in original request AND no completed actions,
+    # return END immediately (don't route to calendar/email)
+    if not completed_actions and original_request:
+        has_actionable = any(kw in original_request for kw in [
+            "schedule", "meeting", "calendar", "appointment", "book", "reserve",
+            "email", "send", "message", "notify", "reminder", "mail"
+        ])
+        if not has_actionable:
+            return "END"
     
     # Check if we just completed an action and need to route to the next one
     # Look at the last few messages to see if a calendar/email agent just ran
@@ -97,34 +108,26 @@ def router(state):
     
     # Look for the most recent AI message from supervisor
     last_ai_message = None
+    content = ""
+    
     for msg in reversed(messages):
         if isinstance(msg, AIMessage):
             last_ai_message = msg
             break
+    if last_ai_message:
+        content = (last_ai_message.content or "").lower()
+
+        # Check for tool calls in the AI message
+        if hasattr(last_ai_message, 'tool_calls') and last_ai_message.tool_calls:
+            tool_calls = last_ai_message.tool_calls
+            for tool_call in tool_calls:
+                tool_name = tool_call.get('name', '') if isinstance(tool_call, dict) else getattr(tool_call, 'name', '')
+                if tool_name == 'schedule_event':
+                    return "calendar"
+                elif tool_name == 'manage_email':
+                    return "email"
+        
     
-    # If no AI message found, analyze the last message's content
-    if last_ai_message is None:
-        last_message = messages[-1] if messages else None
-        if last_message:
-            content = getattr(last_message, 'content', str(last_message)).lower()
-            if any(keyword in content for keyword in ["schedule", "meeting", "calendar", "appointment"]):
-                return "calendar"
-            elif any(keyword in content for keyword in ["email", "send", "message", "notify"]):
-                return "email"
-        return "END"
-    
-    # Check for tool calls in the AI message
-    if hasattr(last_ai_message, 'tool_calls') and last_ai_message.tool_calls:
-        tool_calls = last_ai_message.tool_calls
-        for tool_call in tool_calls:
-            tool_name = tool_call.get('name', '') if isinstance(tool_call, dict) else getattr(tool_call, 'name', '')
-            if tool_name == 'schedule_event':
-                return "calendar"
-            elif tool_name == 'manage_email':
-                return "email"
-    
-    # Fall back to content analysis of supervisor's response
-    content = (last_ai_message.content or "").lower()
     
     # Check for calendar-related keywords
     calendar_keywords = ["schedule", "meeting", "calendar", "appointment", "book", "reserve"]
@@ -154,7 +157,7 @@ def router(state):
     return "END"
  
 
-workflow = StateGraph(AgentState)
+
 
 async def setup_workspace_mcp_tools():
     """Connect to local Google Workspace MCP server and get all tools."""
@@ -179,43 +182,6 @@ async def setup_workspace_mcp_tools():
             return tools, session
         
         
-
-async def setup_calendar_mcp_tools():
-    """Set up calendar MCP tools from remote server."""
-    
-    #For stdio-based MCP servers
-    server_params = StdioServerParameters(
-        command="npx",
-        args=["-y", "mcp-remote", CALENDAR_MCP_URL]
-    )
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            tools = await session.list_tools()
-            
-            #Convert MCP tools to Langchain tools
-            adapter = load_mcp_tools(session)
-            langchain_tools = adapter.to_langchain_tools()
-            
-            return langchain_tools
-            
-            
-async def setup_gmail_mcp_tools():
-    """Set up Gmail MCP tools from remote server."""
-    server_params = StdioServerParameters(
-        command="npx",
-        args=["-y", "mcp-remote", GMAIL_MCP_URL]
-    ) 
-    
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            
-            tools = await load_mcp_tools(session)
-            langchain_tools = tools.to_langchain_tools()
-            
-            return tools
-    
 
 async def initialize_mcp_tools():
     """Initialize MCP tools from remote servers."""
@@ -339,23 +305,40 @@ SUPERVISOR_PROMPT  = (
     "Keep your response concise and focused on routing."
 )
 
-supervisor_agent = create_agent(
-    model,
-    tools=[],  # Supervisor doesn't call tools, it routes to specialized agents
-    system_prompt=SUPERVISOR_PROMPT,
-)
 
 
 calendar_node = create_agent_node(calendar_agent, "calendar") 
 email_node = create_agent_node(email_agent, "email")
 
+def supervisor_node(state):
+    """Supervisor node that uses the model with system prompt."""
+    messages = state["messages"]
+    
+    
+    #Add system prompt if not already present
+    has_system = any(isinstance(m, SystemMessage) for m in messages)
+    if not has_system:
+        system_msg = SystemMessage(content=SUPERVISOR_PROMPT)
+        messages_with_system = [system_msg] + list(messages)
+    else:
+        messages_with_system = messages
+    
+    #Call model directly
+    response = model.invoke(messages_with_system)
+    return {"messages": [response]}
+
+
+
+workflow = StateGraph(AgentState)
+
+
 workflow.add_node("calendar", calendar_node)
 workflow.add_node("email", email_node)
-supervisor_node = create_agent_node(supervisor_agent, "supervisor")
 workflow.add_node("supervisor", supervisor_node)
 
 
 workflow.set_entry_point("supervisor")
+
 workflow.add_conditional_edges(
     "supervisor",
     router,
@@ -386,27 +369,6 @@ workflow.add_conditional_edges(
     }
 )
 
+memory = MemorySaver()
 app = workflow.compile()
 
-
-def run_multi_agent():
-    # Example: User request requiring both calendar and email coordination
-    user_request = (
-        "Schedule a meeting with the design team next Tuesday at 2pm for 1 hour, "
-        "and send them an email reminder about reviewing the new mockups."
-    )
-
-    print("User Request:", user_request)
-    print("\n" + "="*80 + "\n")
-
-    for event in app.stream({"messages": [HumanMessage(content=user_request)], "completed_actions": set()}):
-        for value in event.values():
-            print("---")
-            if "messages" in value:
-                for msg in value["messages"]:
-                    if hasattr(msg, 'pretty_print'):
-                        msg.pretty_print()
-                    else:
-                        print(msg)
-if __name__ == "__main__":
-    run_multi_agent()
