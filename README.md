@@ -47,10 +47,21 @@ This project implements a multi-agent personal assistant using LangGraph. The sy
 4.  **Set up environment variables:**
     Create a `.env` file in the root of the project directory and add your API keys:
     ```
-    OPENAI_API_KEY="your-openai-api-key"
-    GOOGLE_API_KEY="your-google-api-key"
+    export OPENAI_API_KEY=your-openai-api-key
+    export GOOGLE_API_KEY=your-google-api-key
+    export LANGSMITH_TRACING=true
+    export LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com
+    LANGSMITH_API_KEY="your-langsmith-api-key"  # Optional: for observability
+    LANGSMITH_PROJECT="your-project-name"        # Optional: for observability
+    GOOGLE_CLOUD_PROJECT="your-google-cloud-project-id"
     ```
-
+    
+    **Where to find these credentials:**
+    - **OPENAI_API_KEY**: Get from [OpenAI Platform](https://platform.openai.com/api-keys)
+    - **GOOGLE_API_KEY**: Get from [Google AI Studio](https://aistudio.google.com/app/apikey)
+    - **LANGSMITH_API_KEY** & **LANGSMITH_PROJECT**: Optional - Get from [LangSmith](https://smith.langchain.com/) for monitoring and debugging your agent workflows
+    - **GOOGLE_CLOUD_PROJECT**: Your Google Cloud project ID from [Google Cloud Console](https://console.cloud.google.com/) (same project used for Google Workspace APIs)
+    
 ## Usage
 
 This project uses **LangGraph Studio** for interactive development and testing of the multi-agent system.
