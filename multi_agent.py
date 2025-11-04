@@ -1,6 +1,9 @@
 import os
 import operator
 import asyncio
+import uuid
+import sys
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -19,8 +22,11 @@ from langgraph.checkpoint.memory import MemorySaver
 
 
 #Store MCP sessions
+_app_instance = None
 calendar_mcp_tools = None
 gmail_mcp_tools = None
+_mcp_session = None
+_mcp_stdio_context = None
 
 
 
@@ -46,10 +52,16 @@ model = ChatOpenAI(model="gpt-5-nano", temperature=0)
 #model = ChatOllama(model="qwen3:8b", temperature=0)
 
 
+# Debug: Track module loading
+_module_load_id = str(uuid.uuid4())[:8]
+print(f"\n{'='*60}", file=sys.stderr)
+print(f"[MODULE LOAD] multi_agent.py loaded - ID: {_module_load_id}", file=sys.stderr)
+print(f"{'='*60}\n", file=sys.stderr)
+
 #Helper function to create an agent node
 def create_agent_node(agent, agent_name):
-    def agent_node(state):
-        result = agent.invoke(state)
+    async def agent_node(state):
+        result = await agent.ainvoke(state)
         # Get messages from agent result
         messages = result["messages"]
         # Get current completed actions from state, or initialize empty set
@@ -71,11 +83,13 @@ def router(state):
     # Get completed actions from state
     completed_actions = state.get("completed_actions", set())
     
-    # Get the original user request
+    print(f"[ROUTER] Called - Message count: {len(messages)}", file=sys.stderr)
+    
+    # Get the original user request 
     original_request = None
     for m in messages:
         if isinstance(m, HumanMessage):
-            original_request = m.content if m.content else ""
+            original_request = m.content.lower() if m.content else ""
             break
             
     # SHORT-CIRCUIT: If no actionable keywords in original request AND no completed actions,
@@ -159,8 +173,11 @@ def router(state):
 
 
 
-async def setup_workspace_mcp_tools():
-    """Connect to local Google Workspace MCP server and get all tools."""
+@asynccontextmanager
+async def mcp_connection_manager():
+    """Async context manager that keeps MCP connection alive.
+    This ensures the session stays open throughout the application execution."""
+    global _mcp_session, calendar_mcp_tools, gmail_mcp_tools
     
     
     
@@ -174,53 +191,122 @@ async def setup_workspace_mcp_tools():
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
+            _mcp_session = session
             
             # Get all tools from the server
-            tools = await load_mcp_tools(session)
-    
+            all_tools = await load_mcp_tools(session)
             
-            return tools, session
+            # Filter calendar tools
+            calendar_tool_names = [
+                "create_event", "modify_event","list_calendars", 
+                "get_event"
+            ]
+            
+            calendar_mcp_tools = [
+                tool for tool in all_tools 
+                if any(name in tool.name.lower() for name in calendar_tool_names)
+            ]
+            
+            # Filter gmail tools
+            gmail_tool_names = [
+                "send_gmail_message","draft_gmail_message"
+            ]
+            gmail_mcp_tools = [
+                tool for tool in all_tools 
+                if any(name in tool.name.lower() for name in gmail_tool_names)
+            ]
+            
+            print(f"Loaded {len(calendar_mcp_tools)} calendar tools")
+            print(f"Loaded {len(gmail_mcp_tools)} gmail tools")
+            
+            # Verify OAuth authentication is ready before proceeding
+            await verify_mcp_authentication(session, all_tools)
+            
+            # Yield control while keeping connection alive
+            try:
+                yield session
+            finally:
+                # Connection will be closed when context exits
+                _mcp_session = None
         
         
 
+async def verify_mcp_authentication(session, all_tools, max_retries=5, initial_delay=2):
+    """Verify that OAuth authentication is ready by testing a lightweight tool call.
+    
+    Args:
+        session: The MCP client session
+        all_tools: List of all available tools
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds before retrying
+    
+    Raises:
+        RuntimeError: If authentication cannot be verified after all retries
+    """
+    # Find a lightweight tool to test authentication (prefer list_calendars)
+    test_tool = None
+    for tool in all_tools:
+        if "list_calendars" in tool.name.lower():
+            test_tool = tool
+            break
+    
+    # If no list_calendars, try any calendar tool or fall back to first tool
+    if not test_tool:
+        for tool in all_tools:
+            if "calendar" in tool.name.lower():
+                test_tool = tool
+                break
+    
+    if not test_tool and all_tools:
+        test_tool = all_tools[0]
+    
+    if not test_tool:
+        print("[AUTH] Warning: No tools available to verify authentication", file=sys.stderr)
+        return
+    
+    delay = initial_delay
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"[AUTH] Verifying authentication (attempt {attempt}/{max_retries})...", file=sys.stderr)
+            # Try calling the test tool with empty/minimal arguments
+            # Most list tools don't require arguments
+            result = await session.call_tool(test_tool.name, {})
+            print(f"[AUTH] Authentication verified successfully", file=sys.stderr)
+            return
+        except Exception as e:
+            error_msg = str(e).lower()
+            # Check if error is authentication-related
+            if "oauth" in error_msg or "authenticated" in error_msg or "authentication" in error_msg:
+                if attempt < max_retries:
+                    print(f"[AUTH] Authentication not ready yet, waiting {delay}s before retry...", file=sys.stderr)
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 1.5, 10)  # Exponential backoff, max 10s
+                else:
+                    raise RuntimeError(
+                        f"OAuth authentication verification failed after {max_retries} attempts. "
+                        f"Please ensure the Google Workspace MCP server has completed OAuth authentication. "
+                        f"The MCP server may need to complete the OAuth flow in single-user mode. "
+                        f"Last error: {str(e)}"
+                    ) from e
+            else:
+                # If it's not an auth error, authentication might be OK but tool call failed for other reasons
+                print(f"[AUTH] Tool call returned non-auth error, assuming authentication is ready", file=sys.stderr)
+                return
+
 async def initialize_mcp_tools():
-    """Initialize MCP tools from remote servers."""
-    global calendar_mcp_tools, gmail_mcp_tools
-    
-    #Run async functions in sync context
-    # Connect to the workspace MCP server
-    all_tools, session = await setup_workspace_mcp_tools()
-    
-    calendar_tool_names = [
-        "create_event", "modify_event","list_calendars", 
-        "get_event"
-    ]
-    
-    calendar_mcp_tools = [
-        tool for tool in all_tools 
-        if any(name in tool.name.lower() for name in calendar_tool_names)
-    ]
-    
-    # Filter tools for gmail (based on tool names - adjust as needed)
-    gmail_tool_names = [
-        "send_gmail_message","draft_gmail_message"
-    ]
-    gmail_mcp_tools = [
-        tool for tool in all_tools 
-        if any(name in tool.name.lower() for name in gmail_tool_names)
-    ]
-    
-    print(f"Loaded {len(calendar_mcp_tools)} calendar tools")
-    print(f"Loaded {len(gmail_mcp_tools)} gmail tools")
+    """Initialize MCP tools from remote servers.
+    This function must be called within the mcp_connection_manager context."""
+    # Tools are initialized within the context manager
+    # This function is kept for compatibility but does nothing
+    pass
     
 
 
 def initialize_mcp_tools_sync():
-    """Wrapper to run async initialization synchronously."""
-    asyncio.run(initialize_mcp_tools())
-
-# Initialize at module level (or move to a function called before creating agents)
-initialize_mcp_tools_sync()
+    """This function is deprecated - initialization happens in mcp_connection_manager."""
+    # This is a no-op now since initialization happens in the context manager
+    pass
 
 
 
@@ -234,14 +320,6 @@ CALENDAR_AGENT_PROMPT = (
     "Always confirm what was scheduled in your final response. "
 )
 
-calendar_agent = create_agent(
-    model,
-    tools=calendar_mcp_tools,
-    system_prompt=CALENDAR_AGENT_PROMPT,
-)
-
-            
-
 EMAIL_AGENT_PROMPT = (
     "You are an email assistant. "
     "Compose professional emails based on natural language requests. "
@@ -249,51 +327,6 @@ EMAIL_AGENT_PROMPT = (
     "Use send_email to send the message. "
     "Always confirm what was sent in your final response. "
 )
-
-email_agent = create_agent(
-    model,
-    tools=gmail_mcp_tools,
-    system_prompt=EMAIL_AGENT_PROMPT,
-)
-
-
-@tool
-def schedule_event(
-    request: str,
-    runtime: ToolRuntime
-) -> str:
-    """Schedule calendar events using natural language."""
-    
-    original_user_message = next(
-        message for message in runtime.state["messages"]
-        if message.type == "human"
-    )
-    prompt = ("You are assisting with the following user inquiry:\n\n"
-    f"{original_user_message.text}\n\n"
-    "You are tasked with the following sub-request:\n\n"
-    f"{request}"
-    )
-    result = calendar_agent.invoke({
-        "messages": [{"role": "user", "content": prompt}]
-    })
-    return result["messages"][-1].text
-
-
-@tool
-def manage_email(request: str) -> str:
-    """Send emails using natural language.
-
-    Use this when the user wants to send notifications, reminders, or any email
-    communication. Handles recipient extraction, subject generation, and email
-    composition.
-
-    Input: Natural language email request (e.g., 'send them a reminder about
-    the meeting')
-    """
-    result = email_agent.invoke({
-        "messages": [{"role": "user", "content": request}]
-    })
-    return result["messages"][-1].text
 
 SUPERVISOR_PROMPT  = (
     "You are a helpful personal assistant coordinator. "
@@ -305,70 +338,126 @@ SUPERVISOR_PROMPT  = (
     "Keep your response concise and focused on routing."
 )
 
-
-
-calendar_node = create_agent_node(calendar_agent, "calendar") 
-email_node = create_agent_node(email_agent, "email")
-
-def supervisor_node(state):
-    """Supervisor node that uses the model with system prompt."""
-    messages = state["messages"]
+def create_graph():
+    """Create and return the compiled LangGraph application."""
+    global calendar_mcp_tools, gmail_mcp_tools, _app_instance
     
+    if _app_instance is not None:
+        return _app_instance
     
-    #Add system prompt if not already present
-    has_system = any(isinstance(m, SystemMessage) for m in messages)
-    if not has_system:
-        system_msg = SystemMessage(content=SUPERVISOR_PROMPT)
-        messages_with_system = [system_msg] + list(messages)
-    else:
-        messages_with_system = messages
+    # Tools must be initialized before calling create_graph()
+    # This should happen within the mcp_connection_manager context
+    if calendar_mcp_tools is None or gmail_mcp_tools is None:
+        raise RuntimeError("MCP tools not initialized. Call create_graph() within mcp_connection_manager context.")
     
-    #Call model directly
-    response = model.invoke(messages_with_system)
-    return {"messages": [response]}
+    calendar_agent = create_agent(
+        model,
+        tools=calendar_mcp_tools,
+        system_prompt=CALENDAR_AGENT_PROMPT,
+    )
+
+    email_agent = create_agent(
+        model,
+        tools=gmail_mcp_tools,
+        system_prompt=EMAIL_AGENT_PROMPT,
+    )
+
+    print(f"[CREATE_GRAPH] Called in module {_module_load_id}", file=sys.stderr)
+    print(f"[CREATE_GRAPH] _app_instance is None: {_app_instance is None}", file=sys.stderr)
+    #Create nodes
+    calendar_node = create_agent_node(calendar_agent, "calendar") 
+    email_node = create_agent_node(email_agent, "email")
+
+    async def supervisor_node(state):
+        """Supervisor node that uses the model with system prompt."""
+        messages = state["messages"]
+        
+        
+        #Add system prompt if not already present
+        has_system = any(isinstance(m, SystemMessage) for m in messages)
+        if not has_system:
+            system_msg = SystemMessage(content=SUPERVISOR_PROMPT)
+            messages_with_system = [system_msg] + list(messages)
+        else:
+            messages_with_system = messages
+        
+        #Call model directly
+        response = await model.ainvoke(messages_with_system)
+        return {"messages": [response]}
 
 
 
-workflow = StateGraph(AgentState)
+    workflow = StateGraph(AgentState)
+
+    #Build workflow
+    workflow.add_node("calendar", calendar_node)
+    workflow.add_node("email", email_node)
+    workflow.add_node("supervisor", supervisor_node)
 
 
-workflow.add_node("calendar", calendar_node)
-workflow.add_node("email", email_node)
-workflow.add_node("supervisor", supervisor_node)
+    workflow.set_entry_point("supervisor")
+
+    workflow.add_conditional_edges(
+        "supervisor",
+        router,
+        {
+            "calendar": "calendar",
+            "email": "email",
+            "END": END,
+        }
+    )
+
+    # Route calendar and email nodes back to supervisor to check for additional actions
+    workflow.add_conditional_edges(
+        'calendar',
+        router,
+        {
+            "email": "email",
+            "END": END,
+        }
+    )
+    workflow.add_conditional_edges(
+        'email',
+        router,
+        {
+            "calendar": "calendar",
+            "END": END,
+        }
+    )
+
+    _app_instance = workflow.compile()
+    return _app_instance
 
 
-workflow.set_entry_point("supervisor")
+#app = create_graph()
+app = None
 
-workflow.add_conditional_edges(
-    "supervisor",
-    router,
-    {
-        "calendar": "calendar",
-        "email": "email",
-        "END": END,
-    }
-)
 
-# Route calendar and email nodes back to supervisor to check for additional actions
-workflow.add_conditional_edges(
-    'calendar',
-    router,
-    {
-        "calendar": "calendar",
-        "email": "email",
-        "END": END,
-    }
-)
-workflow.add_conditional_edges(
-    'email',
-    router,
-    {
-        "calendar": "calendar",
-        "email": "email",
-        "END": END,
-    }
-)
+async def run_multi_agent():
+    global app
+    
+    # Example: User request requiring both calendar and email coordination
+    user_request = (
+        "send an email to d.wendjwalter@gmail.com with the subject 'Meeting tomorrow'. He should come tomorrow at 10am in the office. My google account email address is satelliteplus12@gmail.com"
+    )
 
-memory = MemorySaver()
-app = workflow.compile()
+    print("User Request:", user_request)
+    print("\n" + "="*80 + "\n")
 
+    # Use the context manager to keep MCP connection alive
+    async with mcp_connection_manager():
+        # Create graph now that tools are initialized
+        if app is None:
+            app = create_graph()
+        
+        async for event in app.astream({"messages": [HumanMessage(content=user_request)], "completed_actions": set()}):
+            for value in event.values():
+                print("---")
+                if "messages" in value:
+                    for msg in value["messages"]:
+                        if hasattr(msg, 'pretty_print'):
+                            msg.pretty_print()
+                        else:
+                            print(msg)
+if __name__ == "__main__":
+    asyncio.run(run_multi_agent())
