@@ -3,6 +3,8 @@ import operator
 import asyncio
 import uuid
 import sys
+import threading
+import atexit
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -11,7 +13,9 @@ from langchain_ollama import ChatOllama #For local model
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import create_agent
 from langchain.tools import tool, ToolRuntime
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, START, END
+from langchain.messages import AnyMessage
+from langgraph.graph.message import add_messages
 from typing import TypedDict, Annotated, Sequence
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
@@ -27,13 +31,17 @@ calendar_mcp_tools = None
 gmail_mcp_tools = None
 _mcp_session = None
 _mcp_stdio_context = None
+_mcp_init_event = threading.Event()
+_mcp_init_thread = None
+_mcp_background_task = None
+_mcp_loop = None
 
 
 
 
-#The AgentState is the graph's state.
-class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], operator.add]
+#The GraphState is the graph's state.
+class GraphState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]
     completed_actions: set[str]  # Track completed agent actions
 
 
@@ -48,7 +56,7 @@ if not os.environ.get("GOOGLE_API_KEY"):
 
 
 #model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-model = ChatOpenAI(model="gpt-5-nano", temperature=0)
+model = ChatOpenAI(model="gpt-5-mini", temperature=0)
 #model = ChatOllama(model="qwen3:8b", temperature=0)
 
 
@@ -89,7 +97,7 @@ def router(state):
     original_request = None
     for m in messages:
         if isinstance(m, HumanMessage):
-            original_request = m.content.lower() if m.content else ""
+            original_request = m.content if m.content else ""
             break
             
     # SHORT-CIRCUIT: If no actionable keywords in original request AND no completed actions,
@@ -231,6 +239,125 @@ async def mcp_connection_manager():
         
         
 
+async def _keep_mcp_connection_alive():
+    """Background task that keeps MCP connection alive indefinitely."""
+    global _mcp_session, calendar_mcp_tools, gmail_mcp_tools
+    
+    server_params = StdioServerParameters(
+        command="uv",
+        args=["run", "--directory", "../google_workspace_mcp", "main.py", "--single-user"]
+    )
+    
+    try:
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                _mcp_session = session
+                
+                # Get all tools from the server
+                all_tools = await load_mcp_tools(session)
+                
+                # Filter calendar tools
+                calendar_tool_names = [
+                    "create_event", "modify_event","list_calendars", 
+                    "get_event"
+                ]
+                
+                calendar_mcp_tools = [
+                    tool for tool in all_tools 
+                    if any(name in tool.name.lower() for name in calendar_tool_names)
+                ]
+                
+                # Filter gmail tools
+                gmail_tool_names = [
+                    "send_gmail_message","draft_gmail_message"
+                ]
+                gmail_mcp_tools = [
+                    tool for tool in all_tools 
+                    if any(name in tool.name.lower() for name in gmail_tool_names)
+                ]
+                
+                print(f"Loaded {len(calendar_mcp_tools)} calendar tools", file=sys.stderr)
+                print(f"Loaded {len(gmail_mcp_tools)} gmail tools", file=sys.stderr)
+                
+                # Verify OAuth authentication is ready before proceeding
+                await verify_mcp_authentication(session, all_tools)
+                
+                # Signal that initialization is complete
+                _mcp_init_event.set()
+                
+                # Keep connection alive indefinitely by waiting on an event that never completes
+                # This prevents the context manager from exiting
+                keep_alive_event = asyncio.Event()
+                try:
+                    await keep_alive_event.wait()  # This will wait forever
+                except asyncio.CancelledError:
+                    # Task was cancelled, allow context manager to exit gracefully
+                    _mcp_session = None
+                    raise
+    except asyncio.CancelledError:
+        # Propagate cancellation
+        _mcp_session = None
+        raise
+
+
+def _mcp_init_thread_func():
+    """Thread function that runs the event loop for MCP connection."""
+    global _mcp_loop, _mcp_background_task
+    
+    # Create a new event loop for this thread
+    _mcp_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_mcp_loop)
+    
+    # Start the background task
+    _mcp_background_task = _mcp_loop.create_task(_keep_mcp_connection_alive())
+    
+    # Run the event loop forever
+    try:
+        _mcp_loop.run_forever()
+    except Exception as e:
+        print(f"[MCP INIT] Error in MCP connection thread: {e}", file=sys.stderr)
+    finally:
+        _mcp_loop.close()
+
+
+def _initialize_mcp_connection():
+    """Initialize MCP connection in a background thread at module import time."""
+    global _mcp_init_thread
+    
+    if _mcp_init_thread is not None:
+        return  # Already initialized
+    
+    print("[MCP INIT] Starting MCP connection initialization...", file=sys.stderr)
+    
+    # Start background thread with event loop
+    _mcp_init_thread = threading.Thread(target=_mcp_init_thread_func, daemon=True)
+    _mcp_init_thread.start()
+    
+    # Wait for initialization to complete (with timeout)
+    if _mcp_init_event.wait(timeout=60):
+        print("[MCP INIT] MCP connection initialized successfully", file=sys.stderr)
+    else:
+        print("[MCP INIT] Warning: MCP initialization timeout", file=sys.stderr)
+        raise RuntimeError("MCP connection initialization timed out")
+
+
+def _cleanup_mcp_connection():
+    """Cleanup function to close MCP connection on process exit."""
+    global _mcp_loop, _mcp_background_task
+    
+    if _mcp_loop is not None and not _mcp_loop.is_closed():
+        print("[MCP CLEANUP] Closing MCP connection...", file=sys.stderr)
+        try:
+            # Cancel the background task if it exists
+            if _mcp_background_task is not None and not _mcp_background_task.done():
+                _mcp_background_task.cancel()
+            # Stop the event loop
+            _mcp_loop.call_soon_threadsafe(_mcp_loop.stop)
+        except Exception as e:
+            print(f"[MCP CLEANUP] Error during cleanup: {e}", file=sys.stderr)
+
+
 async def verify_mcp_authentication(session, all_tools, max_retries=5, initial_delay=2):
     """Verify that OAuth authentication is ready by testing a lightweight tool call.
     
@@ -315,8 +442,7 @@ CALENDAR_AGENT_PROMPT = (
     "You are a calendar scheduling assistant. "
     "Parse natural language scheduling requests (e.g., 'next Tuesday at 2pm')"
     "into proper ISO datetime formats. "
-    "Use get_available_time_slots to check availability when needed. "
-    "Use create_calendar_event to schedule events. "
+    "Use the get_event tool to check for availability based on existing events and if needed schedule event with the tool create_event for a time slot that are not already booked. "
     "Always confirm what was scheduled in your final response. "
 )
 
@@ -324,7 +450,8 @@ EMAIL_AGENT_PROMPT = (
     "You are an email assistant. "
     "Compose professional emails based on natural language requests. "
     "Extract recipient information and craft appropriate subject lines and body text. "
-    "Use send_email to send the message. "
+    "Use the draft_gmail_message tool to draft messages even if the user does not provide a subject or body. "
+    "Use the same tool if the user want the message to be sent"
     "Always confirm what was sent in your final response. "
 )
 
@@ -332,8 +459,9 @@ SUPERVISOR_PROMPT  = (
     "You are a helpful personal assistant coordinator. "
     "Analyze user requests and determine which specialized agent should handle them. "
     "Respond with clear routing hints: "
-    "- If the request involves scheduling, meetings, or calendar events, mention 'calendar' or 'schedule'"
-    "- If the request involves sending emails, messages, or notifications, mention 'email' or 'send'"
+    "- If the request involves scheduling, meetings, or calendar events use the calendar_agent to perform the action"
+    "- If the request involves sending emails, messages, or notifications use the email_agent to execute the action."
+    "- If the request involves none of the words mentioned earlier, DO NOT call any subagent. Just kindly respond to the user."
     "For requests involving multiple actions, prioritize the first action or the most important one. "
     "Keep your response concise and focused on routing."
 )
@@ -343,12 +471,13 @@ def create_graph():
     global calendar_mcp_tools, gmail_mcp_tools, _app_instance
     
     if _app_instance is not None:
+        print(f"[CREATE_GRAPH] Returning cached instance", file=sys.stderr)
         return _app_instance
     
     # Tools must be initialized before calling create_graph()
     # This should happen within the mcp_connection_manager context
     if calendar_mcp_tools is None or gmail_mcp_tools is None:
-        raise RuntimeError("MCP tools not initialized. Call create_graph() within mcp_connection_manager context.")
+        raise RuntimeError("MCP tools not initialized. Ensure MCP connection is established.")
     
     calendar_agent = create_agent(
         model,
@@ -387,17 +516,18 @@ def create_graph():
 
 
 
-    workflow = StateGraph(AgentState)
+    graph = StateGraph(GraphState)
 
-    #Build workflow
-    workflow.add_node("calendar", calendar_node)
-    workflow.add_node("email", email_node)
-    workflow.add_node("supervisor", supervisor_node)
+    #Build graph
+    graph.add_node("calendar", calendar_node)
+    graph.add_node("email", email_node)
+    graph.add_node("supervisor", supervisor_node)
 
 
-    workflow.set_entry_point("supervisor")
+    graph.set_entry_point("supervisor")
+    #graph.add_edge(START, "supervisor")
 
-    workflow.add_conditional_edges(
+    graph.add_conditional_edges(
         "supervisor",
         router,
         {
@@ -408,7 +538,7 @@ def create_graph():
     )
 
     # Route calendar and email nodes back to supervisor to check for additional actions
-    workflow.add_conditional_edges(
+    graph.add_conditional_edges(
         'calendar',
         router,
         {
@@ -416,7 +546,7 @@ def create_graph():
             "END": END,
         }
     )
-    workflow.add_conditional_edges(
+    graph.add_conditional_edges(
         'email',
         router,
         {
@@ -425,39 +555,31 @@ def create_graph():
         }
     )
 
-    _app_instance = workflow.compile()
+    # LangGraph Studio automatically provides checkpointing, so we don't need to add one
+    # Streaming should work automatically with Studio's built-in persistence
+    _app_instance = graph.compile()
+    print(f"[CREATE_GRAPH] Graph compiled successfully", file=sys.stderr)
     return _app_instance
 
 
-#app = create_graph()
-app = None
+# Initialize MCP connection at module import time
+_initialize_mcp_connection()
 
+# Register cleanup handler
+atexit.register(_cleanup_mcp_connection)
 
-async def run_multi_agent():
-    global app
-    
-    # Example: User request requiring both calendar and email coordination
-    user_request = (
-        "send an email to d.wendjwalter@gmail.com with the subject 'Meeting tomorrow'. He should come tomorrow at 10am in the office. My google account email address is satelliteplus12@gmail.com"
-    )
+# IMPORTANT: Wait for MCP tools to be ready before creating graph
+print("[MODULE] Waiting for MCP tools to initialize...", file=sys.stderr)
+if not _mcp_init_event.wait(timeout=60):
+    print("[MODULE] WARNING: MCP initialization timeout, graph may fail", file=sys.stderr)
+else:
+    print("[MODULE] MCP tools ready, creating graph...", file=sys.stderr)
 
-    print("User Request:", user_request)
-    print("\n" + "="*80 + "\n")
-
-    # Use the context manager to keep MCP connection alive
-    async with mcp_connection_manager():
-        # Create graph now that tools are initialized
-        if app is None:
-            app = create_graph()
-        
-        async for event in app.astream({"messages": [HumanMessage(content=user_request)], "completed_actions": set()}):
-            for value in event.values():
-                print("---")
-                if "messages" in value:
-                    for msg in value["messages"]:
-                        if hasattr(msg, 'pretty_print'):
-                            msg.pretty_print()
-                        else:
-                            print(msg)
-if __name__ == "__main__":
-    asyncio.run(run_multi_agent())
+# Create graph after MCP tools are initialized - this is for LangGraph Studio
+try:
+    graph = create_graph()
+    print("[MODULE] Graph created and exported as 'graph'", file=sys.stderr)
+except Exception as e:
+    print(f"[MODULE] Error creating graph: {e}", file=sys.stderr)
+    print("[MODULE] Graph will be created on first use", file=sys.stderr)
+    graph = None
