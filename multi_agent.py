@@ -17,7 +17,7 @@ from langgraph.graph import StateGraph, START, END
 from langchain.messages import AnyMessage
 from langgraph.graph.message import add_messages
 from typing import TypedDict, Annotated, Sequence
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.prebuilt import tools_condition
 from mcp import ClientSession, StdioServerParameters
@@ -39,7 +39,6 @@ _mcp_loop = None
 
 
 
-#The GraphState is the graph's state.
 class GraphState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     completed_actions: set[str]  # Track completed agent actions
@@ -224,8 +223,14 @@ async def mcp_connection_manager():
                 if any(name in tool.name.lower() for name in gmail_tool_names)
             ]
             
-            print(f"Loaded {len(calendar_mcp_tools)} calendar tools")
-            print(f"Loaded {len(gmail_mcp_tools)} gmail tools")
+            print(f"Loaded {len(calendar_mcp_tools)} calendar tools", file=sys.stderr)
+            print(f"Loaded {len(gmail_mcp_tools)} gmail tools", file=sys.stderr)
+            
+            # Log tool names for debugging
+            if calendar_mcp_tools:
+                print(f"Calendar tool names: {[t.name for t in calendar_mcp_tools]}", file=sys.stderr)
+            if gmail_mcp_tools:
+                print(f"Gmail tool names: {[t.name for t in gmail_mcp_tools]}", file=sys.stderr)
             
             # Verify OAuth authentication is ready before proceeding
             await verify_mcp_authentication(session, all_tools)
@@ -279,6 +284,12 @@ async def _keep_mcp_connection_alive():
                 
                 print(f"Loaded {len(calendar_mcp_tools)} calendar tools", file=sys.stderr)
                 print(f"Loaded {len(gmail_mcp_tools)} gmail tools", file=sys.stderr)
+                
+                # Log tool names for debugging
+                if calendar_mcp_tools:
+                    print(f"Calendar tool names: {[t.name for t in calendar_mcp_tools]}", file=sys.stderr)
+                if gmail_mcp_tools:
+                    print(f"Gmail tool names: {[t.name for t in gmail_mcp_tools]}", file=sys.stderr)
                 
                 # Verify OAuth authentication is ready before proceeding
                 await verify_mcp_authentication(session, all_tools)
@@ -440,19 +451,21 @@ def initialize_mcp_tools_sync():
 
 CALENDAR_AGENT_PROMPT = (
     "You are a calendar scheduling assistant. "
-    "Parse natural language scheduling requests (e.g., 'next Tuesday at 2pm')"
-    "into proper ISO datetime formats. "
-    "Use the get_event tool to check for availability based on existing events and if needed schedule event with the tool create_event for a time slot that are not already booked. "
-    "Always confirm what was scheduled in your final response. "
+    "Parse natural language scheduling requests (e.g., 'next Tuesday at 2pm') into proper ISO datetime formats. "
+    "When the user asks to schedule a meeting or create an event, you MUST use the create_event tool to actually create it. "
+    "You may optionally use the get_event or list_calendars tools to check availability first, but you MUST call create_event to actually schedule the meeting. "
+    "Do not just acknowledge the request - you must actually execute the create_event tool with all required parameters (title, start time, end time, etc.). "
+    "Always confirm what was scheduled in your final response with details about the event title, time, and participants if any. "
 )
 
 EMAIL_AGENT_PROMPT = (
     "You are an email assistant. "
     "Compose professional emails based on natural language requests. "
     "Extract recipient information and craft appropriate subject lines and body text. "
-    "Use the draft_gmail_message tool to draft messages even if the user does not provide a subject or body. "
-    "Use the same tool if the user want the message to be sent"
-    "Always confirm what was sent in your final response. "
+    "When the user wants to send an email, you MUST use the send_gmail_message tool to actually send it. "
+    "Only use draft_gmail_message if the user explicitly asks to draft/save a draft without sending. "
+    "If the user asks to send an email, send it immediately using send_gmail_message - do not just draft it. "
+    "Always confirm what was sent in your final response with details about the recipient and subject. "
 )
 
 SUPERVISOR_PROMPT  = (
@@ -478,6 +491,10 @@ def create_graph():
     # This should happen within the mcp_connection_manager context
     if calendar_mcp_tools is None or gmail_mcp_tools is None:
         raise RuntimeError("MCP tools not initialized. Ensure MCP connection is established.")
+    
+    # Log available tools for debugging
+    print(f"[CREATE_GRAPH] Calendar tools: {[t.name for t in calendar_mcp_tools]}", file=sys.stderr)
+    print(f"[CREATE_GRAPH] Gmail tools: {[t.name for t in gmail_mcp_tools]}", file=sys.stderr)
     
     calendar_agent = create_agent(
         model,
