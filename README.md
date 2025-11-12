@@ -43,7 +43,13 @@ This project implements a multi-agent personal assistant using LangGraph. The sy
     # Follow the setup instructions in the google_workspace_mcp repository
     # to configure OAuth credentials and start the MCP server
     ```
-
+    In the `multi_agent.py` file make sure to indicate the right directory of the google Workspace MCP server. Look at the following code snipet from the file:
+    ```
+      server_params = StdioServerParameters(
+        command="uv",
+        args=["run", "--directory", "../google_workspace_mcp", "main.py", "--single-user"]
+    )
+    ``` 
 4.  **Set up environment variables:**
     Create a `.env` file in the root of the project directory and add your API keys:
     ```
@@ -54,6 +60,7 @@ This project implements a multi-agent personal assistant using LangGraph. The sy
     LANGSMITH_API_KEY="your-langsmith-api-key"  # Optional: for observability
     LANGSMITH_PROJECT="your-project-name"        # Optional: for observability
     GOOGLE_CLOUD_PROJECT="your-google-cloud-project-id"
+    export USER_GOOGLE_EMAIL="your-gmail-address-the-ai-agent-will-have-access-to"
     ```
     
     **Where to find these credentials:**
