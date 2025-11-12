@@ -38,7 +38,6 @@ _mcp_loop = None
 
 
 
-
 class GraphState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     completed_actions: set[str]  # Track completed agent actions
@@ -52,6 +51,11 @@ if not os.environ.get("OPENAI_API_KEY"):
 
 if not os.environ.get("GOOGLE_API_KEY"):
     raise ValueError("GOOGLE_API_KEY environment variable not set") from None
+
+# Get user's Google email from environment variable
+user_google_email = os.environ.get("USER_GOOGLE_EMAIL")
+if not user_google_email:
+    raise ValueError("USER_GOOGLE_EMAIL environment variable not set. Please set it in your .env file.") from None
 
 
 #model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
@@ -79,10 +83,13 @@ def create_agent_node(agent, agent_name):
         return {"messages": messages, "completed_actions": completed_actions}
     return agent_node
 
+
+#Routes based on the supervisor agent's response and completion status.
+#Primary routing is based on the supervisor's analysis, with fallback to keyword matching.
 def router(state):
     """
     Routes based on the supervisor agent's response or completion status.
-    Checks for tool calls first, then falls back to content analysis.
+    First checks the supervisor's response for routing intent, then falls back to keyword matching.
     Handles multi-action requests by tracking completed actions.
     """
     messages = state["messages"]
@@ -90,91 +97,108 @@ def router(state):
     # Get completed actions from state
     completed_actions = state.get("completed_actions", set())
     
-    print(f"[ROUTER] Called - Message count: {len(messages)}", file=sys.stderr)
+    print(f"[ROUTER] Called - Message count: {len(messages)}, Completed actions: {completed_actions}", file=sys.stderr)
     
-    # Get the original user request 
+    # Get the original user request (most recent human message)
     original_request = None
-    for m in messages:
+    for m in reversed(messages):
         if isinstance(m, HumanMessage):
             original_request = m.content if m.content else ""
             break
-            
-    # SHORT-CIRCUIT: If no actionable keywords in original request AND no completed actions,
-    # return END immediately (don't route to calendar/email)
-    if not completed_actions and original_request:
-        has_actionable = any(kw in original_request for kw in [
-            "schedule", "meeting", "calendar", "appointment", "book", "reserve",
-            "email", "send", "message", "notify", "reminder", "mail"
-        ])
-        if not has_actionable:
+    
+    if not original_request:
+        print("[ROUTER] No original request found, ending", file=sys.stderr)
+        return "END"
+    
+    original_request_lower = original_request
+    print(f"[ROUTER] Original request: {original_request[:100]}...", file=sys.stderr)
+    
+    # Get the supervisor's response (most recent AIMessage, which should be from supervisor)
+    supervisor_response = None
+    supervisor_response_lower = None
+    for m in reversed(messages):
+        if isinstance(m, AIMessage) and not isinstance(m, ToolMessage):
+            supervisor_response = m.content if m.content else ""
+            supervisor_response_lower = supervisor_response.lower()
+            print(f"[ROUTER] Supervisor response: {supervisor_response[:200]}...", file=sys.stderr)
+            break
+    
+    # Define keywords for routing
+    calendar_keywords = ["schedule", "meeting", "calendar", "appointment", "book", "reserve", "event", "reminder", "scheduling"]
+    email_keywords = ["email", "send", "message", "notify", "reminder", "mail", "e-mail", "compose", "mailing"]
+    
+    # First, try to determine routing from supervisor's response
+    has_calendar = False
+    has_email = False
+    
+    if supervisor_response_lower:
+        # Check supervisor response for routing indicators
+        supervisor_mentions_calendar = any(
+            kw in supervisor_response_lower for kw in 
+            ["calendar", "schedule", "scheduling", "meeting", "appointment", "calendar_agent"]
+        )
+        supervisor_mentions_email = any(
+            kw in supervisor_response_lower for kw in 
+            ["email", "mail", "email_agent", "send", "compose"]
+        )
+        supervisor_mentions_general = any(
+            kw in supervisor_response_lower for kw in 
+            ["general", "question", "answer", "help", "information"]
+        )
+        
+        # If supervisor clearly indicates routing, use that
+        if supervisor_mentions_calendar and not supervisor_mentions_general:
+            has_calendar = True
+            print("[ROUTER] Supervisor indicated calendar routing", file=sys.stderr)
+        if supervisor_mentions_email and not supervisor_mentions_general:
+            has_email = True
+            print("[ROUTER] Supervisor indicated email routing", file=sys.stderr)
+        if supervisor_mentions_general and not (supervisor_mentions_calendar or supervisor_mentions_email):
+            print("[ROUTER] Supervisor indicated general question, ending", file=sys.stderr)
             return "END"
     
-    # Check if we just completed an action and need to route to the next one
-    # Look at the last few messages to see if a calendar/email agent just ran
+    # Fallback to keyword matching on original request if supervisor didn't clearly indicate routing
+    if not has_calendar and not has_email:
+        has_calendar = any(kw in original_request_lower for kw in calendar_keywords)
+        has_email = any(kw in original_request_lower for kw in email_keywords)
+        print(f"[ROUTER] Fallback to keyword matching - Calendar: {has_calendar}, Email: {has_email}", file=sys.stderr)
+    
+    # If no actionable keywords, return END
+    if not has_calendar and not has_email:
+        print("[ROUTER] No actionable keywords found, ending", file=sys.stderr)
+        return "END"
+    
+    # Handle multi-action routing: check if we need to route to the next action
     if completed_actions:
-        # Check if there are more actions pending based on original request
-        if original_request:
-            has_calendar = any(kw in original_request for kw in ["schedule", "meeting", "calendar", "appointment"])
-            has_email = any(kw in original_request for kw in ["email", "send", "message", "notify", "reminder"])
-            
-            # If we just completed calendar and email is still pending, route to email
-            if 'calendar' in completed_actions and has_email and 'email' not in completed_actions:
-                return "email"
-            # If we just completed email and calendar is still pending, route to calendar
-            elif 'email' in completed_actions and has_calendar and 'calendar' not in completed_actions:
-                return "calendar"
-            # If both are completed, end
-            elif ('calendar' in completed_actions and has_calendar) and ('email' in completed_actions and has_email):
-                return "END"
+        # If we just completed calendar and email is still pending, route to email
+        if 'calendar' in completed_actions and has_email and 'email' not in completed_actions:
+            print("[ROUTER] Routing to email (calendar completed)", file=sys.stderr)
+            return "email"
+        # If we just completed email and calendar is still pending, route to calendar
+        elif 'email' in completed_actions and has_calendar and 'calendar' not in completed_actions:
+            print("[ROUTER] Routing to calendar (email completed)", file=sys.stderr)
+            return "calendar"
+        # If both are completed, end
+        elif (('calendar' in completed_actions and has_calendar) and 
+              ('email' in completed_actions and has_email)):
+            print("[ROUTER] All actions completed, ending", file=sys.stderr)
+            return "END"
+        # If one is completed but the other wasn't requested, end
+        elif ('calendar' in completed_actions and not has_email) or ('email' in completed_actions and not has_calendar):
+            print("[ROUTER] Requested action completed, ending", file=sys.stderr)
+            return "END"
     
-    # Look for the most recent AI message from supervisor
-    last_ai_message = None
-    content = ""
-    
-    for msg in reversed(messages):
-        if isinstance(msg, AIMessage):
-            last_ai_message = msg
-            break
-    if last_ai_message:
-        content = (last_ai_message.content or "").lower()
-
-        # Check for tool calls in the AI message
-        if hasattr(last_ai_message, 'tool_calls') and last_ai_message.tool_calls:
-            tool_calls = last_ai_message.tool_calls
-            for tool_call in tool_calls:
-                tool_name = tool_call.get('name', '') if isinstance(tool_call, dict) else getattr(tool_call, 'name', '')
-                if tool_name == 'schedule_event':
-                    return "calendar"
-                elif tool_name == 'manage_email':
-                    return "email"
-        
-    
-    
-    # Check for calendar-related keywords
-    calendar_keywords = ["schedule", "meeting", "calendar", "appointment", "book", "reserve"]
-    has_calendar = any(keyword in content for keyword in calendar_keywords)
-    
-    # Check for email-related keywords
-    email_keywords = ["email", "send", "message", "notify", "reminder", "mail"]
-    has_email = any(keyword in content for keyword in email_keywords)
-    
-    # Prioritize calendar if both are present and not completed
+    # Primary routing logic: route based on supervisor analysis or keyword matching
+    # Prioritize calendar if both are present (calendar usually comes first in workflow)
     if has_calendar and 'calendar' not in completed_actions:
+        print("[ROUTER] Routing to calendar", file=sys.stderr)
         return "calendar"
     elif has_email and 'email' not in completed_actions:
+        print("[ROUTER] Routing to email", file=sys.stderr)
         return "email"
     
-    # If no clear routing signal from supervisor, check original request as fallback
-    if original_request:
-        has_calendar = any(kw in original_request for kw in ["schedule", "meeting", "calendar", "appointment"])
-        has_email = any(kw in original_request for kw in ["email", "send", "message", "notify", "reminder"])
-        
-        if has_calendar and 'calendar' not in completed_actions:
-            return "calendar"
-        if has_email and 'email' not in completed_actions:
-            return "email"
-    
-    # If no clear routing signal, end the workflow
+    # Fallback: if we get here and have actions but they're completed, end
+    print("[ROUTER] No routing match found, ending", file=sys.stderr)
     return "END"
  
 
@@ -190,7 +214,7 @@ async def mcp_connection_manager():
     
     server_params = StdioServerParameters(
         command="uv",
-        args=["run", "--directory", "../google_workspace_mcp", "main.py", "--single-user"]
+        args=["run", "--directory", "../google_workspace_mcp", "main.py"]
     )
     
     
@@ -250,7 +274,7 @@ async def _keep_mcp_connection_alive():
     
     server_params = StdioServerParameters(
         command="uv",
-        args=["run", "--directory", "../google_workspace_mcp", "main.py", "--single-user"]
+        args=["run", "--directory", "../google_workspace_mcp", "main.py"]
     )
     
     try:
@@ -450,34 +474,37 @@ def initialize_mcp_tools_sync():
 
 
 CALENDAR_AGENT_PROMPT = (
-    "You are a calendar scheduling assistant. "
-    "Parse natural language scheduling requests (e.g., 'next Tuesday at 2pm') into proper ISO datetime formats. "
-    "When the user asks to schedule a meeting or create an event, you MUST use the create_event tool to actually create it. "
-    "You may optionally use the get_event or list_calendars tools to check availability first, but you MUST call create_event to actually schedule the meeting. "
-    "Do not just acknowledge the request - you must actually execute the create_event tool with all required parameters (title, start time, end time, etc.). "
-    "Always confirm what was scheduled in your final response with details about the event title, time, and participants if any. "
+    f"You are a calendar scheduling assistant. "
+    f"Parse natural language scheduling requests (e.g., 'next Tuesday at 2pm') into proper ISO datetime formats. "
+    f"When the user asks to schedule a meeting or create an event, you MUST use the create_event tool to actually create it. "
+    f"You may optionally use the get_event or list_calendars tools to check availability first, but you MUST call create_event to actually schedule the meeting. "
+    f"Do not just acknowledge the request - you must actually execute the create_event tool with all required parameters (title, start time, end time, etc.). "
+    f"The user's Google email is {user_google_email}. "
+    f"Always confirm what was scheduled in your final response with details about the event title, time, and participants if any. "
 )
 
 EMAIL_AGENT_PROMPT = (
-    "You are an email assistant. "
-    "Compose professional emails based on natural language requests. "
-    "Extract recipient information and craft appropriate subject lines and body text. "
-    "When the user wants to send an email, you MUST use the send_gmail_message tool to actually send it. "
-    "Only use draft_gmail_message if the user explicitly asks to draft/save a draft without sending. "
-    "If the user asks to send an email, send it immediately using send_gmail_message - do not just draft it. "
-    "Always confirm what was sent in your final response with details about the recipient and subject. "
+    f"You are an email assistant. "
+    f"Compose professional emails based on natural language requests. "
+    f"Extract recipient information and craft appropriate subject lines and body text. "
+    f"When the user wants to send an email, you MUST use the send_gmail_message tool to actually send it. "
+    f"Only use draft_gmail_message if the user explicitly asks to draft/save a draft without sending. "
+    f"If the user asks to send an email, send it immediately using send_gmail_message - do not just draft it. "
+    f"The user's Google email is {user_google_email}. "
+    f"Always confirm what was sent in your final response with details about the recipient and subject. "
 )
 
 SUPERVISOR_PROMPT  = (
     "You are a helpful personal assistant coordinator. "
     "Analyze user requests and determine which specialized agent should handle them. "
-    "Respond with clear routing hints: "
-    "- If the request involves scheduling, meetings, or calendar events use the calendar_agent to perform the action"
-    "- If the request involves sending emails, messages, or notifications use the email_agent to execute the action."
-    "- If the request involves none of the words mentioned earlier, DO NOT call any subagent. Just kindly respond to the user."
-    "For requests involving multiple actions, prioritize the first action or the most important one. "
-    "Keep your response concise and focused on routing."
+    "For scheduling/calendar requests, explicitly mention 'calendar' or 'scheduling' in your response to route to the calendar_agent. "
+    "For email requests, explicitly mention 'email' or 'mail' in your response to route to the email_agent. "
+    "For general questions that don't require calendar or email actions, mention 'general question' or 'information' in your response. "
+    "Keep your responses brief and friendly. "
+    "Always clearly indicate which agent should handle the request by mentioning the relevant keywords (calendar, email, or general)."
 )
+    #"Your role is to acknowledge user requests and provide helpful context. "
+    #"The routing system will automatically direct requests to the appropriate specialist agent."
 
 def create_graph():
     """Create and return the compiled LangGraph application."""
@@ -541,8 +568,8 @@ def create_graph():
     graph.add_node("supervisor", supervisor_node)
 
 
-    graph.set_entry_point("supervisor")
     #graph.add_edge(START, "supervisor")
+    graph.set_entry_point("supervisor")
 
     graph.add_conditional_edges(
         "supervisor",
@@ -572,7 +599,6 @@ def create_graph():
         }
     )
 
-    # LangGraph Studio automatically provides checkpointing, so we don't need to add one
     # Streaming should work automatically with Studio's built-in persistence
     _app_instance = graph.compile()
     print(f"[CREATE_GRAPH] Graph compiled successfully", file=sys.stderr)
