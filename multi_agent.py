@@ -2,43 +2,27 @@ import os
 import asyncio
 import uuid
 import sys
-import threading
-import atexit
-from contextlib import asynccontextmanager
+from typing import TypedDict, Annotated, Sequence
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
-from langchain_ollama import ChatOllama #For local model
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import create_agent
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from typing import TypedDict, Annotated, Sequence
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-
-#Store MCP sessions
+# Store MCP sessions
 _app_instance = None
-calendar_mcp_tools = None
-gmail_mcp_tools = None
 _mcp_session = None
-_mcp_stdio_context = None
-_mcp_init_event = threading.Event()
-_mcp_init_thread = None
-_mcp_background_task = None
-_mcp_loop = None
-
-
+_tools_cache = None
 
 class GraphState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     completed_actions: set[str]  # Track completed agent actions
-
-
-
 
 load_dotenv()
 if not os.environ.get("OPENAI_API_KEY"):
@@ -53,8 +37,8 @@ if not user_google_email:
     raise ValueError("USER_GOOGLE_EMAIL environment variable not set. Please set it in your .env file.") from None
 
 
-#model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-model = ChatOpenAI(model="gpt-5-mini", temperature=0)
+#model = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+model = ChatOpenAI(model="gpt-5.1", temperature=0, reasoning_effort="low")
 #model = ChatOllama(model="qwen3:8b", temperature=0)
 
 
@@ -198,194 +182,55 @@ def router(state):
  
 
 
-
-@asynccontextmanager
-async def mcp_connection_manager():
-    """Async context manager that keeps MCP connection alive.
-    This ensures the session stays open throughout the application execution."""
-    global _mcp_session, calendar_mcp_tools, gmail_mcp_tools
-    
-    
-    
-    server_params = StdioServerParameters(
+def _get_mcp_server_params():
+    """Get MCP server parameters. Centralized for consistency."""
+    return StdioServerParameters(
         command="uv",
         args=["run", "--directory", "../google_workspace_mcp", "main.py", "--single-user"]
     )
+
+
+async def _initialize_mcp_tools_from_session(session):
+    """Initialize and filter MCP tools from a session.
     
-    
-    
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            _mcp_session = session
-            
-            # Get all tools from the server
-            all_tools = await load_mcp_tools(session)
-            
-            # Filter calendar tools
-            calendar_tool_names = [
-                "create_event", "modify_event","list_calendars", 
-                "get_event"
-            ]
-            
-            calendar_mcp_tools = [
-                tool for tool in all_tools 
-                if any(name in tool.name.lower() for name in calendar_tool_names)
-            ]
-            
-            # Filter gmail tools
-            gmail_tool_names = [
-                "send_gmail_message","draft_gmail_message"
-            ]
-            gmail_mcp_tools = [
-                tool for tool in all_tools 
-                if any(name in tool.name.lower() for name in gmail_tool_names)
-            ]
-            
-            print(f"Loaded {len(calendar_mcp_tools)} calendar tools", file=sys.stderr)
-            print(f"Loaded {len(gmail_mcp_tools)} gmail tools", file=sys.stderr)
-            
-            # Log tool names for debugging
-            if calendar_mcp_tools:
-                print(f"Calendar tool names: {[t.name for t in calendar_mcp_tools]}", file=sys.stderr)
-            if gmail_mcp_tools:
-                print(f"Gmail tool names: {[t.name for t in gmail_mcp_tools]}", file=sys.stderr)
-            
-            # Verify OAuth authentication is ready before proceeding
-            await verify_mcp_authentication(session, all_tools)
-            
-            # Yield control while keeping connection alive
-            try:
-                yield session
-            finally:
-                # Connection will be closed when context exits
-                _mcp_session = None
+    Args:
+        session: The MCP client session
         
-        
-
-async def _keep_mcp_connection_alive():
-    """Background task that keeps MCP connection alive indefinitely."""
-    global _mcp_session, calendar_mcp_tools, gmail_mcp_tools
+    Returns:
+        tuple: (calendar_tools, gmail_tools, all_tools)
+    """
+    # Get all tools from the server
+    all_tools = await load_mcp_tools(session)
     
-    server_params = StdioServerParameters(
-        command="uv",
-        args=["run", "--directory", "../google_workspace_mcp", "main.py", "--single-user"]
-    )
+    # Filter calendar tools
+    calendar_tool_names = [
+        "create_event", "modify_event", "list_calendars", "get_event"
+    ]
     
-    try:
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                _mcp_session = session
-                
-                # Get all tools from the server
-                all_tools = await load_mcp_tools(session)
-                
-                # Filter calendar tools
-                calendar_tool_names = [
-                    "create_event", "modify_event","list_calendars", 
-                    "get_event"
-                ]
-                
-                calendar_mcp_tools = [
-                    tool for tool in all_tools 
-                    if any(name in tool.name.lower() for name in calendar_tool_names)
-                ]
-                
-                # Filter gmail tools
-                gmail_tool_names = [
-                    "send_gmail_message","draft_gmail_message"
-                ]
-                gmail_mcp_tools = [
-                    tool for tool in all_tools 
-                    if any(name in tool.name.lower() for name in gmail_tool_names)
-                ]
-                
-                print(f"Loaded {len(calendar_mcp_tools)} calendar tools", file=sys.stderr)
-                print(f"Loaded {len(gmail_mcp_tools)} gmail tools", file=sys.stderr)
-                
-                # Log tool names for debugging
-                if calendar_mcp_tools:
-                    print(f"Calendar tool names: {[t.name for t in calendar_mcp_tools]}", file=sys.stderr)
-                if gmail_mcp_tools:
-                    print(f"Gmail tool names: {[t.name for t in gmail_mcp_tools]}", file=sys.stderr)
-                
-                # Verify OAuth authentication is ready before proceeding
-                await verify_mcp_authentication(session, all_tools)
-                
-                # Signal that initialization is complete
-                _mcp_init_event.set()
-                
-                # Keep connection alive indefinitely by waiting on an event that never completes
-                # This prevents the context manager from exiting
-                keep_alive_event = asyncio.Event()
-                try:
-                    await keep_alive_event.wait()  # This will wait forever
-                except asyncio.CancelledError:
-                    # Task was cancelled, allow context manager to exit gracefully
-                    _mcp_session = None
-                    raise
-    except asyncio.CancelledError:
-        # Propagate cancellation
-        _mcp_session = None
-        raise
-
-
-def _mcp_init_thread_func():
-    """Thread function that runs the event loop for MCP connection."""
-    global _mcp_loop, _mcp_background_task
+    calendar_tools = [
+        tool for tool in all_tools 
+        if any(name in tool.name.lower() for name in calendar_tool_names)
+    ]
     
-    # Create a new event loop for this thread
-    _mcp_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_mcp_loop)
+    # Filter gmail tools
+    gmail_tool_names = [
+        "send_gmail_message", "draft_gmail_message"
+    ]
+    gmail_tools = [
+        tool for tool in all_tools 
+        if any(name in tool.name.lower() for name in gmail_tool_names)
+    ]
     
-    # Start the background task
-    _mcp_background_task = _mcp_loop.create_task(_keep_mcp_connection_alive())
+    print(f"[MCP] Loaded {len(calendar_tools)} calendar tools", file=sys.stderr)
+    print(f"[MCP] Loaded {len(gmail_tools)} gmail tools", file=sys.stderr)
     
-    # Run the event loop forever
-    try:
-        _mcp_loop.run_forever()
-    except Exception as e:
-        print(f"[MCP INIT] Error in MCP connection thread: {e}", file=sys.stderr)
-    finally:
-        _mcp_loop.close()
-
-
-def _initialize_mcp_connection():
-    """Initialize MCP connection in a background thread at module import time."""
-    global _mcp_init_thread
+    # Log tool names for debugging
+    if calendar_tools:
+        print(f"[MCP] Calendar tool names: {[t.name for t in calendar_tools]}", file=sys.stderr)
+    if gmail_tools:
+        print(f"[MCP] Gmail tool names: {[t.name for t in gmail_tools]}", file=sys.stderr)
     
-    if _mcp_init_thread is not None:
-        return  # Already initialized
-    
-    print("[MCP INIT] Starting MCP connection initialization...", file=sys.stderr)
-    
-    # Start background thread with event loop
-    _mcp_init_thread = threading.Thread(target=_mcp_init_thread_func, daemon=True)
-    _mcp_init_thread.start()
-    
-    # Wait for initialization to complete (with timeout)
-    if _mcp_init_event.wait(timeout=60):
-        print("[MCP INIT] MCP connection initialized successfully", file=sys.stderr)
-    else:
-        print("[MCP INIT] Warning: MCP initialization timeout", file=sys.stderr)
-        raise RuntimeError("MCP connection initialization timed out")
-
-
-def _cleanup_mcp_connection():
-    """Cleanup function to close MCP connection on process exit."""
-    global _mcp_loop, _mcp_background_task
-    
-    if _mcp_loop is not None and not _mcp_loop.is_closed():
-        print("[MCP CLEANUP] Closing MCP connection...", file=sys.stderr)
-        try:
-            # Cancel the background task if it exists
-            if _mcp_background_task is not None and not _mcp_background_task.done():
-                _mcp_background_task.cancel()
-            # Stop the event loop
-            _mcp_loop.call_soon_threadsafe(_mcp_loop.stop)
-        except Exception as e:
-            print(f"[MCP CLEANUP] Error during cleanup: {e}", file=sys.stderr)
+    return calendar_tools, gmail_tools, all_tools
 
 
 async def verify_mcp_authentication(session, all_tools, max_retries=5, initial_delay=2):
@@ -451,15 +296,32 @@ async def verify_mcp_authentication(session, all_tools, max_retries=5, initial_d
                 print(f"[AUTH] Tool call returned non-auth error, assuming authentication is ready", file=sys.stderr)
                 return
 
-async def initialize_mcp_tools():
-    """Initialize MCP tools from remote servers.
-    This function must be called within the mcp_connection_manager context."""
-    # Tools are initialized within the context manager
-    # This function is kept for compatibility but does nothing
-    pass
+async def get_mcp_tools():
+    """Lazy initialization on the SAME loop as the app"""
+    global _mcp_session, _tools_cache
     
+    if _tools_cache:
+        return _tools_cache
 
-
+    server_params = _get_mcp_server_params()
+    
+    # Connect directly on the current loop
+    client = stdio_client(server_params)
+    read, write = await client.__aenter__()
+    session = ClientSession(read, write)
+    await session.__aenter__()
+    await session.initialize()
+    
+    _mcp_session = session # Store to keep alive
+    
+    # Load tools
+    calendar_tools, gmail_tools, all_tools = await _initialize_mcp_tools_from_session(session)
+    
+    # Verify authentication
+    await verify_mcp_authentication(session, all_tools)
+    
+    _tools_cache = (calendar_tools, gmail_tools)
+    return _tools_cache
 
 CALENDAR_AGENT_PROMPT = (
     "You are a calendar scheduling assistant. "
@@ -467,7 +329,7 @@ CALENDAR_AGENT_PROMPT = (
     "When the user asks to schedule a meeting or create an event, you MUST use the create_event tool to actually create it. "
     "You may optionally use the get_event or list_calendars tools to check availability irst, but you MUST call create_event to actually schedule the meeting. "
     "Do not just acknowledge the request - you must actually execute the create_event tool with all required parameters (title, start time, end time, etc.). "
-    f"The user's Google email is {user_google_email}. "
+    "The user's Google email is " + str(user_google_email) + ". "
     "Always confirm what was scheduled in your final response with details about the event title, time, and participants if any. "
 )
 
@@ -478,7 +340,7 @@ EMAIL_AGENT_PROMPT = (
     "When the user wants to send an email, you MUST use the send_gmail_message tool to actually send it. "
     "Only use draft_gmail_message if the user explicitly asks to draft/save a draft without sending. "
     "If the user asks to send an email, send it immediately using send_gmail_message - do not just draft it. "
-    f"The user's Google email is {user_google_email}. "
+    "The user's Google email is " + str(user_google_email) + ". "
     "Always confirm what was sent in your final response with details about the recipient and subject. "
 )
 
@@ -494,30 +356,53 @@ SUPERVISOR_PROMPT  = (
 
 def create_graph():
     """Create and return the compiled LangGraph application."""
-    global calendar_mcp_tools, gmail_mcp_tools, _app_instance
+    global _app_instance
     
     if _app_instance is not None:
         print(f"[CREATE_GRAPH] Returning cached instance", file=sys.stderr)
         return _app_instance
     
-    # Tools must be initialized before calling create_graph()
-    # This should happen within the mcp_connection_manager context
-    if calendar_mcp_tools is None or gmail_mcp_tools is None:
-        raise RuntimeError("MCP tools not initialized. Ensure MCP connection is established.")
+    # Initialize tools on the main loop
+    # This blocks the main thread briefly to set up connection if not already done
+    # Use nest_asyncio to allow nested event loops if we are already in one (e.g. Jupyter or Uvicorn)
+    try:
+        import nest_asyncio
+        nest_asyncio.apply()
+    except ImportError:
+        pass
+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    try:
+        if loop.is_running():
+            # If loop is running, we might be in a notebook or server.
+            # Ideally we should await, but create_graph is sync.
+            # nest_asyncio + run_until_complete handles this.
+            cal_tools, gmail_tools = loop.run_until_complete(get_mcp_tools())
+        else:
+            cal_tools, gmail_tools = loop.run_until_complete(get_mcp_tools())
+    except Exception as e:
+        print(f"[CREATE_GRAPH] Error initializing tools: {e}", file=sys.stderr)
+        raise
+
     
     # Log available tools for debugging
-    print(f"[CREATE_GRAPH] Calendar tools: {[t.name for t in calendar_mcp_tools]}", file=sys.stderr)
-    print(f"[CREATE_GRAPH] Gmail tools: {[t.name for t in gmail_mcp_tools]}", file=sys.stderr)
+    print(f"[CREATE_GRAPH] Calendar tools: {[t.name for t in cal_tools]}", file=sys.stderr)
+    print(f"[CREATE_GRAPH] Gmail tools: {[t.name for t in gmail_tools]}", file=sys.stderr)
     
     calendar_agent = create_agent(
         model,
-        tools=calendar_mcp_tools,
+        tools=cal_tools,
         system_prompt=CALENDAR_AGENT_PROMPT,
     )
 
     email_agent = create_agent(
         model,
-        tools=gmail_mcp_tools,
+        tools=gmail_tools,
         system_prompt=EMAIL_AGENT_PROMPT,
     )
 
@@ -589,20 +474,6 @@ def create_graph():
     _app_instance = graph.compile()
     print(f"[CREATE_GRAPH] Graph compiled successfully", file=sys.stderr)
     return _app_instance
-
-
-# Initialize MCP connection at module import time
-_initialize_mcp_connection()
-
-# Register cleanup handler
-atexit.register(_cleanup_mcp_connection)
-
-# IMPORTANT: Wait for MCP tools to be ready before creating graph
-print("[MODULE] Waiting for MCP tools to initialize...", file=sys.stderr)
-if not _mcp_init_event.wait(timeout=60):
-    print("[MODULE] WARNING: MCP initialization timeout, graph may fail", file=sys.stderr)
-else:
-    print("[MODULE] MCP tools ready, creating graph...", file=sys.stderr)
 
 # Create graph after MCP tools are initialized - this is for LangGraph Studio
 try:
