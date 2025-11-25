@@ -11,3 +11,8 @@ wheels/
 
 # Environment variables
 .env
+
+
+*.pckl
+*.pickle
+*.pkl
