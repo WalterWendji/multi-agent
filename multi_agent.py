@@ -2,6 +2,7 @@ import os
 import asyncio
 import uuid
 import sys
+import atexit
 from typing import TypedDict, Annotated, Sequence
 
 from dotenv import load_dotenv
@@ -19,6 +20,8 @@ from mcp.client.stdio import stdio_client
 _app_instance = None
 _mcp_session = None
 _tools_cache = None
+_mcp_client_cm = None  # Store the stdio_client context manager
+_mcp_session_cm = None  # Store the ClientSession context manager
 
 class GraphState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
@@ -186,7 +189,9 @@ def _get_mcp_server_params():
     """Get MCP server parameters. Centralized for consistency."""
     return StdioServerParameters(
         command="uv",
-        args=["run", "--directory", "../google_workspace_mcp", "main.py", "--single-user"]
+        args=["run", "--directory", "../google_workspace_mcp", "main.py", "--single-user"],
+        #rgs=["run", "--directory", "../google_workspace_mcp", "main.py", "--transport", "streamable-http"],
+        #env=os.environ.copy()
     )
 
 
@@ -233,7 +238,7 @@ async def _initialize_mcp_tools_from_session(session):
     return calendar_tools, gmail_tools, all_tools
 
 
-async def verify_mcp_authentication(session, all_tools, max_retries=5, initial_delay=2):
+async def verify_mcp_authentication(session, all_tools, max_retries=20, initial_delay=5):
     """Verify that OAuth authentication is ready by testing a lightweight tool call.
     
     Args:
@@ -298,7 +303,7 @@ async def verify_mcp_authentication(session, all_tools, max_retries=5, initial_d
 
 async def get_mcp_tools():
     """Lazy initialization on the SAME loop as the app"""
-    global _mcp_session, _tools_cache
+    global _mcp_session, _tools_cache, _mcp_client_cm, _mcp_session_cm
     
     if _tools_cache:
         return _tools_cache
@@ -306,10 +311,12 @@ async def get_mcp_tools():
     server_params = _get_mcp_server_params()
     
     # Connect directly on the current loop
-    client = stdio_client(server_params)
-    read, write = await client.__aenter__()
-    session = ClientSession(read, write)
-    await session.__aenter__()
+    # Store context managers so they can be properly closed later
+    _mcp_client_cm = stdio_client(server_params)
+    read, write = await _mcp_client_cm.__aenter__()
+    
+    _mcp_session_cm = ClientSession(read, write)
+    session = await _mcp_session_cm.__aenter__()
     await session.initialize()
     
     _mcp_session = session # Store to keep alive
@@ -322,6 +329,43 @@ async def get_mcp_tools():
     
     _tools_cache = (calendar_tools, gmail_tools)
     return _tools_cache
+
+
+async def cleanup_mcp_connection():
+    """Properly close MCP connection."""
+    global _mcp_session, _mcp_client_cm, _mcp_session_cm, _tools_cache
+    
+    if _mcp_session_cm is not None:
+        try:
+            await _mcp_session_cm.__aexit__(None, None, None)
+        except Exception:
+            pass
+        _mcp_session_cm = None
+    
+    if _mcp_client_cm is not None:
+        try:
+            await _mcp_client_cm.__aexit__(None, None, None)
+        except Exception:
+            pass
+        _mcp_client_cm = None
+    
+    _mcp_session = None
+    _tools_cache = None
+
+
+def _sync_cleanup():
+    """Synchronous cleanup wrapper for atexit."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(cleanup_mcp_connection())
+        else:
+            loop.run_until_complete(cleanup_mcp_connection())
+    except Exception:
+        pass  # Best effort cleanup
+
+
+atexit.register(_sync_cleanup)
 
 CALENDAR_AGENT_PROMPT = (
     "You are a calendar scheduling assistant. "
