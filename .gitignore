@@ -16,3 +16,6 @@ wheels/
 *.pckl
 *.pickle
 *.pkl
+
+credentials.json
+token.json
