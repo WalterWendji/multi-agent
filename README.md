@@ -12,14 +12,14 @@ This project implements a multi-agent personal assistant using LangGraph. The sy
 - **Supervisor Agent**: A master agent that interprets user requests and coordinates the other agents to fulfill them. It can handle complex, multi-step tasks that require both scheduling and emailing.
 - **Powered by LangGraph**: Leverages the LangGraph framework for building agentic applications with Large Language Models.
 - **LLM Integration**: Utilizes commercial GPT or local models for natural language understanding and generation. It is also configured to potentially use Google's GenAI models.
-- **Google Workspace Integration**: Uses the [google_workspace_mcp](https://github.com/taylorwilsdon/google_workspace_mcp) MCP server to interact with Google Calendar, Gmail, and other Google Workspace services.
+- **Google Workspace Integration**: Directly integrates with Google Calendar and Gmail APIs for seamless operations.
 
 ## Requirements
 
 - Python 3.12+
 - `uv` package manager
-- A commercial LLM key like (OPENAI API, Google API key)
-- Google Workspace MCP server running locally
+- A commercial LLM key (OpenAI API key)
+- Google Cloud Project with Calendar and Gmail APIs enabled
 
 ## Setup and Installation
 
@@ -30,26 +30,19 @@ This project implements a multi-agent personal assistant using LangGraph. The sy
     ```
 
 2.  **Install dependencies:**
-    This project uses `uv` for dependency management. Install dependencies with:
+    This project uses `uv` for dependency management.
     ```bash
     uv sync
     ```
+    This will install all required packages.
 
-3.  **Set up Google Workspace MCP Server:**
-    Clone and configure the Google Workspace MCP server:
-    ```bash
-    git clone https://github.com/taylorwilsdon/google_workspace_mcp
-    cd google_workspace_mcp
-    # Follow the setup instructions in the google_workspace_mcp repository
-    # to configure OAuth credentials and start the MCP server
-    ```
-    In the `multi_agent.py` file make sure to indicate the right directory of the google Workspace MCP server. Look at the following code snipet from the file:
-    ```
-      server_params = StdioServerParameters(
-        command="uv",
-        args=["run", "--directory", "../google_workspace_mcp", "main.py", "--single-user"]
-    )
-    ``` 
+3.  **Set up Google Cloud Credentials:**
+    - Go to the [Google Cloud Console](https://console.cloud.google.com/).
+    - Create a project and enable the **Google Calendar API** and **Gmail API**.
+    - Go to **APIs & Services > Credentials**.
+    - Create **OAuth 2.0 Client IDs** (Application type: Desktop app).
+    - Download the JSON file, rename it to `credentials.json`, and place it in the root directory of this project.
+
 4.  **Set up environment variables:**
     Create a `.env` file in the root of the project directory and add your API keys:
     ```
@@ -67,8 +60,8 @@ This project implements a multi-agent personal assistant using LangGraph. The sy
     - **OPENAI_API_KEY**: Get from [OpenAI Platform](https://platform.openai.com/api-keys)
     - **GOOGLE_API_KEY**: Get from [Google AI Studio](https://aistudio.google.com/app/apikey)
     - **LANGSMITH_API_KEY** & **LANGSMITH_PROJECT**: Optional - Get from [LangSmith](https://smith.langchain.com/) for monitoring and debugging your agent workflows
-    - **GOOGLE_CLOUD_PROJECT**: Your Google Cloud project ID from [Google Cloud Console](https://console.cloud.google.com/) (same project used for Google Workspace APIs)
-    
+    - **GOOGLE_CLOUD_PROJECT**: Your Google Cloud project ID from [Google Cloud Console](https://console.cloud.google.com/)
+
 ## Usage
 
 This project uses **LangGraph Studio** for interactive development and testing of the multi-agent system.
@@ -83,9 +76,11 @@ uv run langgraph dev
 
 This will:
 - Start the LangGraph development server 
-- Open the LangGraph Studio interface in your browser with the link https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024
+- Open the LangGraph Studio interface in your browser
 - Allow you to interact with the agent system through a visual interface
 - Provide real-time monitoring of agent decisions and tool calls
+
+**Note:** On the first run, a browser window will open asking you to authorize the application to access your Google Calendar and Gmail. Follow the prompts to allow access. A `token.json` file will be created to store your session.
 
 ### Example Interactions
 
@@ -100,9 +95,9 @@ The supervisor agent will coordinate with the Calendar and Email agents to fulfi
 
 The system consists of:
 - **Supervisor Agent**: Routes tasks to specialized agents based on the request
-- **Calendar Agent**: Handles Google Calendar operations via MCP server
-- **Email Agent**: Handles Gmail operations via MCP server
-- **Google Workspace MCP Server**: Provides secure, standardized access to Google Workspace APIs
+- **Calendar Agent**: Handles Google Calendar operations via direct API calls
+- **Email Agent**: Handles Gmail operations via direct API calls
+- **Google Tools**: A local module (`google_tools.py`) that handles OAuth authentication and API interactions
 
 ## Next Steps
 - Add more Google Workspace integrations (Google Drive, Docs, Sheets, etc.)
